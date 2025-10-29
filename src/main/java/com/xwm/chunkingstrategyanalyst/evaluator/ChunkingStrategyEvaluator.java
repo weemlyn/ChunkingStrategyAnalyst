@@ -118,16 +118,16 @@ public class ChunkingStrategyEvaluator {
         Map<String, DocumentSplitter> strategies = new HashMap<>();
 
         // 策略1: 固定大小分割 - 200 tokens，重叠20 tokens
-        strategies.put("fixed_200", new DocumentByParagraphSplitter(200, 20));
+        strategies.put("fixed_200_20", new DocumentByParagraphSplitter(200, 20));
 
         // 策略2: 固定大小分割 - 500 tokens，重叠50 tokens
-        strategies.put("fixed_500", new DocumentByParagraphSplitter(500, 50));
+        strategies.put("fixed_500_50", new DocumentByParagraphSplitter(500, 50));
 
         // 策略3: 递归分割 - 500 tokens，重叠50 tokens
-        strategies.put("recursive_500", new DocumentByParagraphSplitter(500, 50));
+        strategies.put("recursive_500_50", DocumentSplitters.recursive(500, 50));
 
         // 策略4: 按句子分割 - 300 tokens，重叠30 tokens
-        strategies.put("sentence_based", new DocumentBySentenceSplitter(300, 30));
+        strategies.put("sentence_based_300_30", new DocumentBySentenceSplitter(300, 30));
 
         // 策略5: 滑动窗口 - 500 tokens，重叠100 tokens
         strategies.put("sliding_window_500_100", new DocumentByParagraphSplitter(500, 100));
@@ -629,26 +629,77 @@ public class ChunkingStrategyEvaluator {
 
     /**
      * 评估上下文利用率
-     * 衡量生成回答中有效利用上下文信息的程度
+     * 使用语义相似度而非完全匹配来判断答案是否利用了上下文
      * @param answer 生成的回答
      * @param context 提供的上下文
      * @return 上下文利用率分数（0-1之间，越高表示利用越好）
      */
     private double evaluateContextUtilization(String answer, String context) {
         // 按句子分割回答和上下文
-        String[] answerSentences = answer.split("[。.!?]");
-        String[] contextSentences = context.split("[。.!?]");
+        String[] answerSentences = answer.split("[。.!?\\n]");
+        String[] contextSentences = context.split("[。.!?\\n]");
 
         if (answerSentences.length == 0 || contextSentences.length == 0) return 0.0;
 
-        // 计算回答中基于上下文句子的比例
-        long utilized = Arrays.stream(answerSentences)
-                .filter(sentence ->
-                        Arrays.stream(contextSentences).anyMatch(ctxSentence ->
-                                sentence.contains(ctxSentence) || ctxSentence.contains(sentence)))
-                .count();
+        // 为所有上下文句子生成embedding（缓存以避免重复计算）
+        List<Embedding> contextEmbeddings = new ArrayList<>();
+        for (String ctxSentence : contextSentences) {
+            ctxSentence = ctxSentence.trim();
+            if (ctxSentence.isEmpty() || ctxSentence.length() < 3) continue;
+            try {
+                Embedding embedding = embeddingModel.embed(ctxSentence).content();
+                contextEmbeddings.add(embedding);
+            } catch (Exception e) {
+                // 如果某个上下文句子处理失败，跳过它
+                continue;
+            }
+        }
 
-        return (double) utilized / answerSentences.length;
+        if (contextEmbeddings.isEmpty()) return 0.0;
+
+        int utilizedCount = 0;
+        int validAnswerSentences = 0;
+        // 相似度阈值：超过此阈值的答案句子认为利用了上下文
+        double similarityThreshold = 0.6;
+
+        // 对每个答案句子，计算它与所有上下文句子的最大相似度
+        for (String answerSentence : answerSentences) {
+            answerSentence = answerSentence.trim();
+            if (answerSentence.isEmpty() || answerSentence.length() < 3) continue;
+
+            try {
+                // 为答案句子生成embedding
+                Embedding answerEmbedding = embeddingModel.embed(answerSentence).content();
+                float[] answerVector = answerEmbedding.vector();
+                List<Float> answerVectorList = new ArrayList<>();
+                for (float f : answerVector) answerVectorList.add(f);
+
+                // 计算与所有上下文句子的相似度，取最大值
+                double maxSimilarity = 0.0;
+                for (Embedding ctxEmbedding : contextEmbeddings) {
+                    float[] contextVector = ctxEmbedding.vector();
+                    List<Float> contextVectorList = new ArrayList<>();
+                    for (float f : contextVector) contextVectorList.add(f);
+
+                    double similarity = cosineSimilarity(answerVectorList, contextVectorList);
+                    maxSimilarity = Math.max(maxSimilarity, similarity);
+                }
+
+                validAnswerSentences++;
+                // 如果最大相似度超过阈值，认为该句子利用了上下文
+                if (maxSimilarity >= similarityThreshold) {
+                    utilizedCount++;
+                }
+            } catch (Exception e) {
+                // 如果某个答案句子处理失败，跳过它
+                continue;
+            }
+        }
+
+        if (validAnswerSentences == 0) return 0.0;
+
+        // 返回利用了上下文的句子比例
+        return (double) utilizedCount / validAnswerSentences;
     }
 
     /**
