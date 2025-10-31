@@ -9,6 +9,7 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingSearchResult;
@@ -21,7 +22,7 @@ public class ChunkingStrategyEvaluator {
     private final List<Document> documents;  // 待处理的文档列表
     private final List<QAPair> qaPairs;      // 测试用的QA对列表
     private final EmbeddingModel embeddingModel;  // 嵌入模型，用于生成向量
-    private final QwenChatModel chatModel;      // 聊天模型，用于生成回答
+    private final OllamaChatModel chatModel;      // 聊天模型，用于生成回答
     private final Map<String, String> segmentTextToDocIdMap;  // 文本片段内容到文档ID的映射
 
     /**
@@ -39,9 +40,9 @@ public class ChunkingStrategyEvaluator {
 
 
         // 初始化聊天模型 - 用于生成回答和评估
-        this.chatModel = QwenChatModel.builder()
-                .modelName("qwen3-max")
-                .apiKey("sk-196000a734cd4450a28ec874781bcdec")
+        this.chatModel = OllamaChatModel.builder()
+                .baseUrl("https://wluen85x1o-11434.cnb.run")
+                .modelName("qwen3:8b")
                 .build();
     }
 
@@ -86,13 +87,13 @@ public class ChunkingStrategyEvaluator {
             @SuppressWarnings("unchecked")
             Map<Integer, Double> precisionAtK = (Map<Integer, Double>) retrievalMetrics.get("precisionAtK");
 
-            // 创建评估指标对象（NDCG暂时设为0，需要更复杂的实现）
+            // 创建评估指标对象
             EvaluationMetrics metrics = new EvaluationMetrics(
                     strategyName,
                     recallAtK,
                     precisionAtK,
                     (Double) retrievalMetrics.get("mrr"),
-                    0.0, // NDCG 需要更复杂的排序质量评估实现
+                    (Double) retrievalMetrics.get("ndcg"),
                     (Double) retrievalMetrics.get("latency"),
                     segments.size(),
                     generationMetrics.get("faithfulness"),
@@ -115,21 +116,24 @@ public class ChunkingStrategyEvaluator {
      * @return 策略名称到分割器的映射
      */
     public Map<String, DocumentSplitter> defineStrategies() {
-        Map<String, DocumentSplitter> strategies = new HashMap<>();
+        Map<String, DocumentSplitter> strategies = new LinkedHashMap<>();
 
         // 策略1: 固定大小分割 - 200 tokens，重叠20 tokens
-        strategies.put("fixed_200_20", new DocumentByParagraphSplitter(200, 20));
+        strategies.put("fixed_200_0", new DocumentByParagraphSplitter(200, 0));
 
         // 策略2: 固定大小分割 - 500 tokens，重叠50 tokens
-        strategies.put("fixed_500_50", new DocumentByParagraphSplitter(500, 50));
+        strategies.put("fixed_500_0", new DocumentByParagraphSplitter(500, 0));
 
-        // 策略3: 递归分割 - 500 tokens，重叠50 tokens
+        // 策略3: 递归分割
+        strategies.put("recursive_200_20", DocumentSplitters.recursive(200, 20));
         strategies.put("recursive_500_50", DocumentSplitters.recursive(500, 50));
 
-        // 策略4: 按句子分割 - 300 tokens，重叠30 tokens
-        strategies.put("sentence_based_300_30", new DocumentBySentenceSplitter(300, 30));
+        // 策略4: 按句子分割
+        strategies.put("sentence_based_200_20", new DocumentBySentenceSplitter(300, 30));
+        strategies.put("sentence_based_500_50", new DocumentBySentenceSplitter(300, 30));
 
-        // 策略5: 滑动窗口 - 500 tokens，重叠100 tokens
+        // 策略5: 滑动窗口
+        strategies.put("sliding_window_200_20", new DocumentByParagraphSplitter(500, 100));
         strategies.put("sliding_window_500_100", new DocumentByParagraphSplitter(500, 100));
 
         return strategies;
@@ -208,6 +212,7 @@ public class ChunkingStrategyEvaluator {
         Map<Integer, Double> recallScores = new HashMap<>();
         Map<Integer, Double> precisionScores = new HashMap<>();
         List<Double> reciprocalRanks = new ArrayList<>();  // 用于计算MRR
+        List<Double> ndcgScores = new ArrayList<>();       // 用于计算NDCG@K
 
         // 定义要评估的K值
 //        K值影响分析：
@@ -291,6 +296,40 @@ public class ChunkingStrategyEvaluator {
                     break;
                 }
             }
+
+            // 计算NDCG@5（基于文档级别、二元相关性）
+            int kForNdcg = 5;
+            List<String> topKForNdcg = retrievedIds.subList(0, Math.min(kForNdcg, retrievedIds.size()));
+            // 保持顺序的去重，得到唯一文档的排名列表
+            List<String> rankedUniqueDocs = new ArrayList<>();
+            Set<String> added = new HashSet<>();
+            for (String id : topKForNdcg) {
+                if (added.add(id)) {
+                    rankedUniqueDocs.add(id);
+                }
+            }
+
+            // 计算DCG
+            double dcg = 0.0;
+            for (int i = 0; i < rankedUniqueDocs.size(); i++) {
+                String docId = rankedUniqueDocs.get(i);
+                int rel = groundTruthDocs.contains(docId) ? 1 : 0; // 二元相关性
+                int rank = i + 1;
+                double discount = 1.0 / (Math.log(rank + 1) / Math.log(2));
+                dcg += rel * discount;
+            }
+
+            // 计算IDCG（理想排序，将所有相关文档放在前面）
+            int idealCount = Math.min(kForNdcg, groundTruthDocs.size());
+            double idcg = 0.0;
+            for (int i = 0; i < idealCount; i++) {
+                int rank = i + 1;
+                double discount = 1.0 / (Math.log(rank + 1) / Math.log(2));// 1.0 / log2（rank+1）
+                idcg += 1.0 * discount; // 二元相关性
+            }
+
+            double ndcg = (idcg == 0.0) ? 0.0 : (dcg / idcg);
+            ndcgScores.add(ndcg);
         }
 
         // 计算各项指标的平均值
@@ -301,8 +340,9 @@ public class ChunkingStrategyEvaluator {
             precisionAtK.put(k, precisionScores.get(k) / totalQueries);
         }
 
-        // 计算MRR和平均延迟
+        // 计算MRR、NDCG和平均延迟
         double mrr = reciprocalRanks.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        double ndcgAvg = ndcgScores.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
         double avgLatency = totalLatency / totalQueries;
 
         // 组装结果
@@ -310,10 +350,11 @@ public class ChunkingStrategyEvaluator {
         results.put("recallAtK", recallAtK);
         results.put("precisionAtK", precisionAtK);
         results.put("mrr", mrr);
+        results.put("ndcg", ndcgAvg);
         results.put("latency", avgLatency);
 
-        System.out.printf("检索评估完成: Recall@5=%.3f, MRR=%.3f, 平均延迟=%.2fms%n",
-                recallAtK.get(5), mrr, avgLatency);
+        System.out.printf("检索评估完成: Recall@5=%.3f, MRR=%.3f, NDCG@5=%.3f, 平均延迟=%.2fms%n",
+                recallAtK.get(5), mrr, ndcgAvg, avgLatency);
 
         return results;
     }

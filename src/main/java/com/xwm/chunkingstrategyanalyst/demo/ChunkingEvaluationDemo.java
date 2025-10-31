@@ -438,17 +438,18 @@ public class ChunkingEvaluationDemo {
         System.out.println("=".repeat(100));
 
         // 表头
-        System.out.printf("%-20s %-10s %-12s %-8s %-10s %-10s %-12s %-10s%n",
-                "策略", "Recall@5", "Precision@5", "MRR", "忠实度", "幻觉率", "构建时间(s)", "索引大小");
+        System.out.printf("%-20s %-10s %-12s %-8s %-8s %-10s %-10s %-12s %-10s%n",
+                "策略", "Recall@5", "Precision@5", "MRR", "NDCG@5", "忠实度", "幻觉率", "构建时间(s)", "索引大小");
         System.out.println("-".repeat(100));
 
         // 逐行输出每个策略的结果
         for (EvaluationMetrics metrics : results) {
-            System.out.printf("%-20s %-10.3f %-12.3f %-8.3f %-10.3f %-10.3f %-12.2f %-10d%n",
+            System.out.printf("%-20s %-10.3f %-12.3f %-8.3f %-8.3f %-10.3f %-10.3f %-12.2f %-10d%n",
                     metrics.getStrategyName(),
                     metrics.getRecallAtK().get(5),
                     metrics.getPrecisionAtK().get(5),
                     metrics.getMrr(),
+                    metrics.getNdcg(),
                     metrics.getFaithfulness(),
                     metrics.getHallucinationRate(),
                     metrics.getBuildSpeed(),
